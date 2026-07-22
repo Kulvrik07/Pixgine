@@ -1212,6 +1212,98 @@ impl EP {
                     }
                 }
 
+                // Grid overlay - show grid lines and coordinate axes
+                // Grid settings - use tile size for alignment
+                let tile_size = vp.tile_layers.first().map(|l| l.ts as f32).unwrap_or(16.0);
+                let grid_spacing = tile_size.max(16.0); // Use tile size for perfect alignment
+                let grid_color = Color32::from_rgba_unmultiplied(100, 100, 100, 120); // Medium gray, semi-transparent
+                let axis_color_x = Color32::from_rgb(255, 100, 100); // Bright red
+                let axis_color_y = Color32::from_rgb(100, 255, 100); // Bright green
+                let coord_color = Color32::from_rgb(255, 255, 255); // White for better visibility
+                let axis_width = 2.5;
+
+                // Calculate visible world bounds
+                let world_left = (vp.view_offset.0 / vp.view_scale).max(-1000.0);
+                let world_right = ((vp.view_offset.0 + dw) / vp.view_scale).min(1000.0);
+                let world_top = (-vp.view_offset.1 / vp.view_scale).max(-1000.0);
+                let world_bottom = ((-vp.view_offset.1 + dh) / vp.view_scale).min(1000.0);
+
+                // Draw vertical grid lines (lines of constant X)
+                // Align to grid spacing for perfect tile alignment
+                let start_x = (world_left / grid_spacing).floor() * grid_spacing;
+                let mut x = start_x;
+                while x <= world_right {
+                    let screen_pos = self.world_to_screen(x, 0.0, &vr_rect, vp);
+                    if screen_pos.x >= vr_rect.left() && screen_pos.x <= vr_rect.right() {
+                        // Check if this is the Y=0 axis line (X=0)
+                        if (x - 0.0).abs() < 0.5 {
+                            // Y-axis (X=0) - thicker, brighter line
+                            ui.painter().line_segment([
+                                egui::Pos2::new(screen_pos.x, vr_rect.top() + 20.0),
+                                egui::Pos2::new(screen_pos.x, vr_rect.bottom() - 20.0)
+                            ], (axis_width, axis_color_x));
+                        } else {
+                            // Regular grid line
+                            ui.painter().line_segment([
+                                egui::Pos2::new(screen_pos.x, vr_rect.top()),
+                                egui::Pos2::new(screen_pos.x, vr_rect.bottom())
+                            ], (1.0, grid_color));
+                        }
+                        // Draw X coordinate label (only if near top)
+                        let label = format!("{:.0}", x);
+                        ui.painter().text(egui::pos2(screen_pos.x, vr_rect.top() + 5.0), 
+                            egui::Align2::CENTER_TOP, label, egui::TextStyle::Small.resolve(ui.style()), coord_color);
+                    }
+                    x += grid_spacing;
+                }
+
+                // Draw horizontal grid lines (lines of constant Y)
+                let start_y = (world_top / grid_spacing).floor() * grid_spacing;
+                let mut y = start_y;
+                while y <= world_bottom {
+                    let screen_pos = self.world_to_screen(0.0, y, &vr_rect, vp);
+                    if screen_pos.y >= vr_rect.top() && screen_pos.y <= vr_rect.bottom() {
+                        // Check if this is the X=0 axis line (Y=0)
+                        if (y - 0.0).abs() < 0.5 {
+                            // X-axis (Y=0) - thicker, brighter line
+                            ui.painter().line_segment([
+                                egui::Pos2::new(vr_rect.left() + 20.0, screen_pos.y),
+                                egui::Pos2::new(vr_rect.right() - 20.0, screen_pos.y)
+                            ], (axis_width, axis_color_y));
+                        } else {
+                            // Regular grid line
+                            ui.painter().line_segment([
+                                egui::Pos2::new(vr_rect.left(), screen_pos.y),
+                                egui::Pos2::new(vr_rect.right(), screen_pos.y)
+                            ], (1.0, grid_color));
+                        }
+                        // Draw Y coordinate label (only if near left)
+                        let label = format!("{:.0}", y);
+                        ui.painter().text(egui::pos2(5.0, screen_pos.y), 
+                            egui::Align2::LEFT_CENTER, label, egui::TextStyle::Small.resolve(ui.style()), coord_color);
+                    }
+                    y += grid_spacing;
+                }
+
+                // Draw origin marker (0,0) - intersection of axes
+                let origin_screen = self.world_to_screen(0.0, 0.0, &vr_rect, vp);
+                if origin_screen.x >= vr_rect.left() && origin_screen.x <= vr_rect.right() &&
+                   origin_screen.y >= vr_rect.top() && origin_screen.y <= vr_rect.bottom() {
+                    // Cross marker at origin with thicker lines
+                    let size = 10.0;
+                    ui.painter().line_segment([
+                        egui::Pos2::new(origin_screen.x - size, origin_screen.y),
+                        egui::Pos2::new(origin_screen.x + size, origin_screen.y)
+                    ], (3.0, Color32::YELLOW));
+                    ui.painter().line_segment([
+                        egui::Pos2::new(origin_screen.x, origin_screen.y - size),
+                        egui::Pos2::new(origin_screen.x, origin_screen.y + size)
+                    ], (3.0, Color32::YELLOW));
+                    // Origin label
+                    ui.painter().text(egui::pos2(origin_screen.x + 15.0, origin_screen.y - 15.0), 
+                        egui::Align2::LEFT_TOP, "0,0", egui::TextStyle::Small.resolve(ui.style()), Color32::YELLOW);
+                }
+
                 // Info overlay
                 let info = format!("{}x{} @ {:.0}% | {:?}", vp.tex_size.0, vp.tex_size.1, (dw / vp.tex_size.0 as f32) * 100.0, vp.transform_mode);
                 ui.painter().text(egui::pos2(vr_rect.left()+4.0, vr_rect.top()+4.0), egui::Align2::LEFT_TOP, 
