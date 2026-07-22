@@ -207,8 +207,25 @@ impl EP {
             ui.label(format!("🔍 {:.0}%", vp.view_scale * 100.0));
             if ui.button("100%").clicked() { vp.view_scale = 1.0; vp.view_offset = (0.0, 0.0); }
             if ui.button("200%").clicked() { vp.view_scale = 2.0; vp.view_offset = (0.0, 0.0); }
-            if ui.button("➕").clicked() { vp.view_scale = (vp.view_scale * 1.25).min(10.0); vp.view_offset = (vp.view_offset.0.round(), vp.view_offset.1.round()); }
-            if ui.button("➖").clicked() { vp.view_scale = (vp.view_scale / 1.25).max(0.1); vp.view_offset = (vp.view_offset.0.round(), vp.view_offset.1.round()); }
+            if ui.button("300%").clicked() { vp.view_scale = 3.0; vp.view_offset = (0.0, 0.0); }
+            if ui.button("400%").clicked() { vp.view_scale = 4.0; vp.view_offset = (0.0, 0.0); }
+            if ui.button("800%").clicked() { vp.view_scale = 8.0; vp.view_offset = (0.0, 0.0); }
+            if ui.button("➕").clicked() {
+                if vp.pixel_perfect {
+                    vp.view_scale = (vp.view_scale + 1.0).min(10.0);
+                } else {
+                    vp.view_scale = (vp.view_scale * 1.25).min(10.0);
+                }
+                vp.view_offset = (vp.view_offset.0.round(), vp.view_offset.1.round());
+            }
+            if ui.button("➖").clicked() {
+                if vp.pixel_perfect {
+                    vp.view_scale = (vp.view_scale - 1.0).max(1.0);
+                } else {
+                    vp.view_scale = (vp.view_scale / 1.25).max(0.1);
+                }
+                vp.view_offset = (vp.view_offset.0.round(), vp.view_offset.1.round());
+            }
             if ui.button("⟲ Reset").clicked() { vp.view_scale = 1.0; vp.view_offset = (0.0, 0.0); }
             ui.separator();
             ui.label("🖱 Right-drag=Pan | Scroll=Zoom");
@@ -1053,8 +1070,21 @@ impl EP {
             if scroll != 0.0 && in_viewport {
                 let old_scale = vp.view_scale;
                 let zoom_factor = if scroll > 0.0 { 1.15 } else { 1.0 / 1.15 };
-                let new_scale = (old_scale * zoom_factor).clamp(0.1, 20.0);
-                
+                let mut new_scale = (old_scale * zoom_factor).clamp(0.1, 20.0);
+
+                // Pixel-perfect: snap to nearest integer zoom level
+                if vp.pixel_perfect {
+                    new_scale = new_scale.round().max(1.0);
+                    // Don't zoom if already at the integer boundary
+                    if new_scale == old_scale {
+                        new_scale = if scroll > 0.0 {
+                            (old_scale + 1.0).min(20.0)
+                        } else {
+                            (old_scale - 1.0).max(1.0)
+                        };
+                    }
+                }
+
                 let (mouse_wx, mouse_wy) = self.screen_to_world(mouse_pos, &vr_rect, vp);
                 vp.view_scale = new_scale;
                 
@@ -1067,8 +1097,12 @@ impl EP {
                 
                 let new_ox = nx * vp.tex_size.0 as f32 - mouse_wx * new_scale;
                 let new_oy = mouse_wy * new_scale - ny * vp.tex_size.1 as f32;
-                
-                vp.view_offset = (new_ox, new_oy);
+
+                if vp.pixel_perfect {
+                    vp.view_offset = (new_ox.round(), new_oy.round());
+                } else {
+                    vp.view_offset = (new_ox, new_oy);
+                }
             }
 
             // Right-click pan
@@ -1085,7 +1119,14 @@ impl EP {
                     let (dw, dh) = if vr_rect.width()/vr_rect.height() > a { (vr_rect.height()*a, vr_rect.height()) } else { (vr_rect.width(), vr_rect.width()/a) };
                     let dx = (mouse_pos.x - start.x) * (vp.tex_size.0 as f32 / dw);
                     let dy = (mouse_pos.y - start.y) * (vp.tex_size.1 as f32 / dh);
-                    vp.view_offset = (self.pan_offset_start.0 + dx, self.pan_offset_start.1 - dy);
+                    let new_ox = self.pan_offset_start.0 + dx;
+                    let new_oy = self.pan_offset_start.1 - dy;
+                    // Pixel-perfect: snap offset to integers
+                    if vp.pixel_perfect {
+                        vp.view_offset = (new_ox.round(), new_oy.round());
+                    } else {
+                        vp.view_offset = (new_ox, new_oy);
+                    }
                 }
             }
             if !rc_down { self.panning = false; }
@@ -1190,7 +1231,9 @@ impl EP {
                 // Drag-and-drop textures
                 if let Some(dropped_tex) = vp.drag_tex_id {
                     if in_viewport && lc {
+                        let (mouse_wx, mouse_wy) = self.screen_to_world(mouse_pos, &vr_rect, vp);
                         if let Some(sel) = vp.selected {
+                            // Assign texture to selected entity
                             vp.save_undo();
                             if let Some(mut sp) = vp.world.get_mut::<Sprite>(sel) {
                                 sp.texture_id = Some(dropped_tex);
@@ -1209,8 +1252,36 @@ impl EP {
                                 }
                                 vp.lua_log.push("[asset] assigned texture to entity".to_string());
                             }
+                        } else {
+                            // No entity selected — create a new sprite entity with this texture
+                            vp.save_undo();
+                            let (tw, th) = vp.textures.get(&dropped_tex)
+                                .map(|(_, w, h, _)| (*w, *h))
+                                .unwrap_or((16, 16));
+                            let auto_tile = crate::viewport::auto_tile_size(tw, th);
+                            let mut sp = Sprite::default();
+                            sp.texture_id = Some(dropped_tex);
+                            sp.source_width = auto_tile;
+                            sp.source_height = auto_tile;
+                            sp.source_x = 0;
+                            sp.source_y = 0;
+                            if !vp.spritesheet_info.contains_key(&dropped_tex) {
+                                let si = crate::viewport::SpritesheetInfo::new(tw, th, auto_tile, auto_tile);
+                                vp.spritesheet_info.insert(dropped_tex, si);
+                            }
+                            let e = vp.world.spawn((
+                                Transform::new(mouse_wx, mouse_wy),
+                                sp,
+                            )).id();
+                            let name = vp.drag_tex_name.clone()
+                                .unwrap_or_else(|| format!("Sprite_{}", vp.entities.len()));
+                            vp.entity_names.insert(e, name);
+                            vp.refresh();
+                            vp.selected = Some(e);
+                            vp.lua_log.push(format!("[asset] created sprite entity with texture", ));
                         }
                         vp.drag_tex_id = None;
+                        vp.drag_tex_name = None;
                     }
                 }
                 
@@ -1526,35 +1597,71 @@ impl EP {
                         if r.double_clicked() {
                             if name.ends_with(".json") { let _ = vp.load_scene(&path); }
                             else if name.ends_with(".lua") { vp.scripts.push(name.clone()); }
-                            else if name.ends_with(".png") || name.ends_with(".jpg") { 
-                                // Check if texture already loaded (avoid duplicates)
+                            else if name.ends_with(".png") || name.ends_with(".jpg") {
+                                // Double-clicking a PNG now just loads it into the texture
+                                // cache and opens a preview window — it does NOT auto-assign
+                                // to any entity.  To assign, drag the texture onto the
+                                // viewport or use the "Create Sprite Entity" button.
                                 let already_loaded = self.imported_textures.iter().any(|(_, n, _, _)| *n == name);
-                                if already_loaded {
-                                    // Already loaded, just set as drag source
-                                    if let Some(tex_info) = self.imported_textures.iter().find(|(_, n, _, _)| *n == name) {
-                                        vp.drag_tex_id = Some(tex_info.0);
-                                        vp.drag_tex_name = Some(name.clone());
-                                    }
-                                } else {
+                                if !already_loaded {
                                     let dev_queue = vp.ren_ctx.as_ref().map(|c| (c.dev.clone(), c.queue.clone()));
                                     if let Some((dev, queue)) = dev_queue {
                                         if let Ok(bytes) = std::fs::read(&path) {
                                             if let Some(tex_id) = vp.import_and_slice_texture(&dev, &queue, &bytes, true) {
                                                 let (tw, th) = vp.textures.get(&tex_id).map(|(_, w, h, _)| (*w, *h)).unwrap_or((0,0));
                                                 self.imported_textures.push((tex_id, name.clone(), tw, th));
-                                                // Set as drag source
-                                                vp.drag_tex_id = Some(tex_id);
-                                                vp.drag_tex_name = Some(name.clone());
+                                                vp.lua_log.push(format!("[asset] loaded texture: {} ({}x{})", name, tw, th));
                                             }
                                         }
                                     }
                                 }
+                                // Open texture preview window
+                                vp.selected_tex_preview = self.imported_textures.iter()
+                                    .find(|(_, n, _, _)| *n == name)
+                                    .map(|(id, _, w, h)| (*id, name.clone(), *w, *h));
                             }
                         }
                         r.context_menu(|ui| {
                             let p = path.clone();
                             if name.ends_with(".json") { if ui.button("Open Scene").clicked() { let _ = vp.load_scene(&p); ui.close_menu(); } }
                             if name.ends_with(".lua") { if ui.button("Add Script").clicked() { vp.scripts.push(name.clone()); ui.close_menu(); } }
+                            if name.ends_with(".png") || name.ends_with(".jpg") {
+                                if ui.button("🖼 Preview").clicked() {
+                                    let tex_info = self.imported_textures.iter()
+                                        .find(|(_, n, _, _)| *n == name)
+                                        .map(|(id, _, w, h)| (*id, name.clone(), *w, *h));
+                                    vp.selected_tex_preview = tex_info;
+                                    ui.close_menu();
+                                }
+                                if ui.button("➕ Sprite Entity").clicked() {
+                                    let dev_queue = vp.ren_ctx.as_ref().map(|c| (c.dev.clone(), c.queue.clone()));
+                                    if let Some((dev, queue)) = dev_queue {
+                                        if let Ok(bytes) = std::fs::read(&p) {
+                                            if let Some(tex_id) = vp.import_and_slice_texture(&dev, &queue, &bytes, true) {
+                                                let (tw, th) = vp.textures.get(&tex_id).map(|(_, w, h, _)| (*w, *h)).unwrap_or((16,16));
+                                                let already = self.imported_textures.iter().any(|(_, n, _, _)| *n == name);
+                                                if !already {
+                                                    self.imported_textures.push((tex_id, name.clone(), tw, th));
+                                                }
+                                                let auto_tile = crate::viewport::auto_tile_size(tw, th);
+                                                let mut sp = Sprite::default();
+                                                sp.texture_id = Some(tex_id);
+                                                sp.source_width = auto_tile;
+                                                sp.source_height = auto_tile;
+                                                if !vp.spritesheet_info.contains_key(&tex_id) {
+                                                    vp.spritesheet_info.insert(tex_id, crate::viewport::SpritesheetInfo::new(tw, th, auto_tile, auto_tile));
+                                                }
+                                                let e = vp.world.spawn((Transform::new(160.0, 90.0), sp)).id();
+                                                vp.entity_names.insert(e, name.clone());
+                                                vp.refresh();
+                                                vp.selected = Some(e);
+                                                vp.save_undo();
+                                            }
+                                        }
+                                    }
+                                    ui.close_menu();
+                                }
+                            }
                             if ui.button("Delete").clicked() { let _ = std::fs::remove_file(&p); ui.close_menu(); }
                         });
                     }
@@ -1797,6 +1904,66 @@ impl EP {
                         self.show_export_dialog = false;
                     }
                     if ui.button("Cancel").clicked() { self.show_export_dialog = false; }
+                });
+        }
+
+        // Texture preview window
+        if let Some((tex_id, tex_name, tw, th)) = &vp.selected_tex_preview {
+            let tex_name_clone = tex_name.clone();
+            let (tw_clone, th_clone) = (*tw, *th);
+            let tex_id_clone = *tex_id;
+            egui::Window::new(format!("🖼 {}", tex_name))
+                .collapsible(false)
+                .resizable(true)
+                .default_size([300.0, 300.0])
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(format!("**{}** ({}x{})", tex_name_clone, tw_clone, th_clone));
+                    ui.separator();
+
+                    // Show the actual texture image
+                    if let Some((_, _, _, egui_tex_opt)) = vp.textures.get(&tex_id_clone) {
+                        if let Some(egui_tex) = egui_tex_opt {
+                            let max_size = 256.0;
+                            let scale = (tw_clone as f32 / max_size).max(th_clone as f32 / max_size).max(1.0);
+                            let display_w = (tw_clone as f32 / scale).min(max_size);
+                            let display_h = (th_clone as f32 / scale).min(max_size);
+                            let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(display_w, display_h));
+                            ui.painter().image(
+                                egui::TextureId::from(*egui_tex),
+                                rect,
+                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                egui::Color32::WHITE,
+                            );
+                            ui.add_space(display_h);
+                        }
+                    }
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("➕ Sprite Entity").clicked() {
+                            let (tw2, th2) = vp.textures.get(&tex_id_clone)
+                                .map(|(_, w, h, _)| (*w, *h))
+                                .unwrap_or((16, 16));
+                            let auto_tile = crate::viewport::auto_tile_size(tw2, th2);
+                            let mut sp = Sprite::default();
+                            sp.texture_id = Some(tex_id_clone);
+                            sp.source_width = auto_tile;
+                            sp.source_height = auto_tile;
+                            if !vp.spritesheet_info.contains_key(&tex_id_clone) {
+                                vp.spritesheet_info.insert(tex_id_clone, crate::viewport::SpritesheetInfo::new(tw2, th2, auto_tile, auto_tile));
+                            }
+                            let e = vp.world.spawn((Transform::new(160.0, 90.0), sp)).id();
+                            vp.entity_names.insert(e, tex_name_clone.clone());
+                            vp.refresh();
+                            vp.selected = Some(e);
+                            vp.save_undo();
+                            vp.selected_tex_preview = None;
+                        }
+                        if ui.button("✕ Close").clicked() {
+                            vp.selected_tex_preview = None;
+                        }
+                    });
                 });
         }
     }

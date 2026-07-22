@@ -18,3 +18,4 @@ pub use pipeline::*;
 pub use sprite_batch::*;
 pub use texture::*;
 pub use camera::*;
+pub use crate::core::PixelScale;

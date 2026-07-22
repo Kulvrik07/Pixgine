@@ -1,8 +1,14 @@
 use crate::core::VirtualResolution;
-use crate::renderer::{PixelPerfectPipeline, SpriteBatch, TextureManager, Camera};
+use crate::renderer::{PixelPerfectPipeline, UpscalePipeline, SpriteBatch, TextureManager, Camera, PixelScale};
 use anyhow::Result;
 
 /// The main render context that owns all GPU resources.
+///
+/// Architecture:
+/// 1. Sprites are rendered to a **virtual-resolution framebuffer** (e.g. 320×180)
+///    using an orthographic projection in pixel coordinates.
+/// 2. The framebuffer is upscaled to the window using **nearest-neighbor**
+///    filtering with an integer scale factor, guaranteeing pixel-perfect output.
 pub struct RenderContext {
     pub surface: wgpu::Surface<'static>,
     pub device: wgpu::Device,
@@ -14,6 +20,12 @@ pub struct RenderContext {
     pub sprite_batch: SpriteBatch,
     pub textures: TextureManager,
     pub camera: Camera,
+    /// Virtual-resolution framebuffer texture
+    framebuffer: wgpu::Texture,
+    /// View of the framebuffer (sampled by the upscale pass)
+    framebuffer_view: wgpu::TextureView,
+    /// Upscale pipeline (framebuffer → window, nearest-neighbor)
+    upscale: UpscalePipeline,
     window_width: u32,
     window_height: u32,
 }
@@ -44,10 +56,35 @@ impl RenderContext {
         };
         surface.configure(&device, &config);
 
+        // --- Virtual-resolution framebuffer ---
+        let framebuffer = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Virtual Resolution Framebuffer"),
+            size: wgpu::Extent3d {
+                width: virtual_res.width,
+                height: virtual_res.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let framebuffer_view = framebuffer.create_view(&wgpu::TextureViewDescriptor::default());
+
         let pipeline = PixelPerfectPipeline::new(&device, format, &virtual_res);
         let sprite_batch = SpriteBatch::new(&device, &virtual_res);
         let textures = TextureManager::new(&device, &queue);
         let camera = Camera::new(&virtual_res);
+        let upscale = UpscalePipeline::new(
+            &device,
+            format,
+            &framebuffer_view,
+            &virtual_res,
+            window_width,
+            window_height,
+        );
 
         Self {
             surface,
@@ -60,6 +97,9 @@ impl RenderContext {
             sprite_batch,
             textures,
             camera,
+            framebuffer,
+            framebuffer_view,
+            upscale,
             window_width,
             window_height,
         }
@@ -71,6 +111,8 @@ impl RenderContext {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
+        // Recalculate integer pixel scale for the upscale pass
+        self.upscale.resize(&self.virtual_res, width, height);
     }
 
     pub fn begin_frame(&mut self) -> Option<wgpu::SurfaceTexture> {
@@ -98,40 +140,24 @@ impl RenderContext {
             label: Some("Render Encoder"),
         });
 
-        // Clear the framebuffer
-        let _ = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Clear Pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.9,
-                        g: 0.2,
-                        b: 0.2,
-                        a: 1.0,
-                    }),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-
+        // --- Pass 1: Render sprites to the virtual-resolution framebuffer ---
         // Flush sprite batch and render
         self.sprite_batch.flush(&self.device, &self.queue);
 
-        // Render sprites through the pixel-perfect pipeline
         self.pipeline.render(
             &self.queue,
             &mut encoder,
-            &view,
+            &self.framebuffer_view,
             &self.sprite_batch,
             &self.camera,
             &self.virtual_res,
-            self.window_width,
-            self.window_height,
+        );
+
+        // --- Pass 2: Upscale framebuffer → window (nearest-neighbor) ---
+        self.upscale.render(
+            &mut encoder,
+            &view,
+            &self.virtual_res,
         );
 
         self.queue.submit(std::iter::once(encoder.finish()));

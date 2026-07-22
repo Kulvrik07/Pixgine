@@ -96,6 +96,8 @@ pub struct VP {
     // drag-and-drop state
     pub drag_tex_id: Option<u64>,
     pub drag_tex_name: Option<String>,
+    /// Currently selected texture for preview window (tex_id, name, w, h)
+    pub selected_tex_preview: Option<(u64, String, u32, u32)>,
     // build/export
     pub export_path: Option<PathBuf>,
     // grid & viewport settings
@@ -253,6 +255,7 @@ impl VP {
             audio_manager: None,
             drag_tex_id: None,
             drag_tex_name: None,
+            selected_tex_preview: None,
             export_path: None,
             tilesheet_path: None,
             egui_renderer: None,
@@ -799,23 +802,31 @@ impl VP {
         }
 
         let (w, h) = (self.tex_size.0 as f32, self.tex_size.1 as f32);
+
+        // --- Pixel-perfect: snap zoom and offset to integers ---
+        // When pixel_perfect is enabled, view_scale snaps to the nearest
+        // integer (1x, 2x, 3x …) and view_offset snaps to integer pixels.
+        // This guarantees every virtual pixel maps to a perfect integer
+        // block of render-target pixels — zero distortion at any zoom.
+        if self.pixel_perfect {
+            self.view_scale = self.view_scale.round().max(1.0);
+            self.view_offset.0 = self.view_offset.0.round();
+            self.view_offset.1 = self.view_offset.1.round();
+        }
+
         let (ox, oy) = self.view_offset;
         let vs = self.view_scale;
-        // Pixel-perfect: compute sub-pixel jitter so world origin maps to
-        // an exact integer pixel center (eliminates shimmering at any zoom).
-        // Under the base matrix:
-        //   pixel_x = vs*wx + ox
-        //   pixel_y = vs*wy - oy
-        // We want pixel(0,0) to land on an integer pixel, so we compute the
-        // fractional part of the screen position of world origin and apply
-        // inverse jitter to the projection matrix.
-        let screen_ox = ox;           // screen pixel x of world (0,0)
-        let screen_oy = -oy;          // screen pixel y of world (0,0), positive = down
-        // frac() gives [0, 1), we want to snap to nearest integer
-        // so we need to subtract the fractional part
-        let frac_x = screen_ox - screen_ox.floor();
-        let frac_y = screen_oy - screen_oy.floor();
-        // Jitter in NDC: subtract the fractional offset so pixel(0,0) snaps
+
+        // Sub-pixel jitter: snap framebuffer origin (0,0) to an exact integer
+        // pixel in the render target.  This eliminates sub-pixel shimmering
+        // even when pixel_perfect is off and view_offset is fractional.
+        //
+        // Screen pixel of framebuffer origin (0,0):
+        //   pixel_x = ox
+        //   pixel_y = -oy
+        // We subtract the fractional part so the origin lands on floor().
+        let frac_x = ox - ox.floor();
+        let frac_y = oy - oy.floor();
         let jitter_ndc_x = -frac_x * 2.0 / w;
         let jitter_ndc_y = -frac_y * 2.0 / h;
         queue.write_buffer(&self.ubuf, 0, bytemuck::cast_slice(&[[
