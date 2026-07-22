@@ -1,0 +1,15 @@
+[package]
+name = "pixgine-game"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pixgine-engine = { path = "../engine" }
+winit = "0.30"
+wgpu = "24.0"
+pollster = "0.4"
+bevy_ecs = "0.15"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
