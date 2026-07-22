@@ -1,6 +1,6 @@
 use egui::{CentralPanel, SidePanel, TopBottomPanel, TextureId, Color32, Rgba, Frame};
 use pixgine_engine::ecs::*;
-use crate::viewport::{VP, TransformMode, GizmoAxis, TL};
+use crate::viewport::{VP, TransformMode, GizmoAxis};
 use std::path::PathBuf;
 use std::collections::HashMap;
 use bevy_ecs::entity::Entity;
@@ -180,16 +180,33 @@ impl EP {
                 if ui.button("⏹ Stop").clicked() { vp.playing = false; }
             }
             ui.separator();
-            if ui.button("↩").on_hover_text("Undo").clicked() { vp.restore_undo(); }
-            if ui.button("↪").on_hover_text("Redo").clicked() { vp.restore_redo(); }
+            if ui.button("↶").on_hover_text("Undo (Ctrl+Z)").clicked() { vp.restore_undo(); }
+            if ui.button("↷").on_hover_text("Redo (Ctrl+Shift+Z)").clicked() { vp.restore_redo(); }
             ui.separator();
             // Transform mode buttons
             if ui.selectable_label(vp.transform_mode == TransformMode::Move, "✚ Move (W)").clicked() { vp.transform_mode = TransformMode::Move; }
             if ui.selectable_label(vp.transform_mode == TransformMode::Rotate, "⟳ Rot (E)").clicked() { vp.transform_mode = TransformMode::Rotate; }
             if ui.selectable_label(vp.transform_mode == TransformMode::Scale, "⤡ Scale (R)").clicked() { vp.transform_mode = TransformMode::Scale; }
             ui.separator();
+            // Grid & Snap controls
+            if ui.selectable_label(vp.show_grid, "🌐 Grid").clicked() { vp.show_grid = !vp.show_grid; }
+            if ui.selectable_label(vp.snap_to_grid, "🧲 Snap").clicked() { vp.snap_to_grid = !vp.snap_to_grid; }
+            if ui.selectable_label(vp.pixel_perfect, "👾 Pixel").on_hover_text("Pixel Perfect Crisp Rendering").clicked() { vp.pixel_perfect = !vp.pixel_perfect; }
+            
+            egui::ComboBox::from_id_salt("grid_size_combo")
+                .selected_text(format!("{}px", vp.grid_size))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut vp.grid_size, 8, "8x8");
+                    ui.selectable_value(&mut vp.grid_size, 16, "16x16");
+                    ui.selectable_value(&mut vp.grid_size, 32, "32x32");
+                    ui.selectable_value(&mut vp.grid_size, 64, "64x64");
+                });
+
+            ui.separator();
             // View controls
             ui.label(format!("🔍 {:.0}%", vp.view_scale * 100.0));
+            if ui.button("100%").clicked() { vp.view_scale = 1.0; vp.view_offset = (0.0, 0.0); }
+            if ui.button("200%").clicked() { vp.view_scale = 2.0; vp.view_offset = (0.0, 0.0); }
             if ui.button("➕").clicked() { vp.view_scale = (vp.view_scale * 1.25).min(10.0); vp.view_offset = (vp.view_offset.0.round(), vp.view_offset.1.round()); }
             if ui.button("➖").clicked() { vp.view_scale = (vp.view_scale / 1.25).max(0.1); vp.view_offset = (vp.view_offset.0.round(), vp.view_offset.1.round()); }
             if ui.button("⟲ Reset").clicked() { vp.view_scale = 1.0; vp.view_offset = (0.0, 0.0); }
@@ -197,7 +214,7 @@ impl EP {
             ui.label("🖱 Right-drag=Pan | Scroll=Zoom");
             ui.separator(); 
             ui.label(format!("📐 {}x{}", vp.tex_size.0, vp.tex_size.1));
-            if vp.entities.len() > 0 { ui.label(format!("📦 {} ents", vp.entities.len())); }
+            if !vp.entities.is_empty() { ui.label(format!("📦 {} ents", vp.entities.len())); }
             if let Some(p) = &vp.scene_path { 
                 ui.separator(); 
                 let name = p.file_stem().unwrap_or_default().to_string_lossy();
@@ -1026,18 +1043,35 @@ impl EP {
         CentralPanel::default().show(ctx, |ui| {
             let r = ui.available_rect_before_wrap();
             let (vr_id, vr_rect) = ui.allocate_space(r.size());
-            let vr_response = ui.interact(vr_rect, vr_id, egui::Sense::click_and_drag());
+            let _vr_response = ui.interact(vr_rect, vr_id, egui::Sense::click_and_drag());
             
-            // Scroll to zoom
-            let scroll = ctx.input(|i| i.raw_scroll_delta.y);
             let mouse_pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or(egui::Pos2::ZERO));
             let in_viewport = vr_rect.contains(mouse_pos);
+            
+            // Cursor-centered zoom
+            let scroll = ctx.input(|i| i.raw_scroll_delta.y);
             if scroll != 0.0 && in_viewport {
-                vp.view_scale = (vp.view_scale * (1.0 + scroll * 0.002)).clamp(0.1, 10.0);
-                vp.view_offset = (vp.view_offset.0.round(), vp.view_offset.1.round());
+                let old_scale = vp.view_scale;
+                let zoom_factor = if scroll > 0.0 { 1.15 } else { 1.0 / 1.15 };
+                let new_scale = (old_scale * zoom_factor).clamp(0.1, 20.0);
+                
+                let (mouse_wx, mouse_wy) = self.screen_to_world(mouse_pos, &vr_rect, vp);
+                vp.view_scale = new_scale;
+                
+                let a = vp.tex_size.0 as f32 / vp.tex_size.1 as f32;
+                let (dw, dh) = if vr_rect.width()/vr_rect.height() > a { (vr_rect.height()*a, vr_rect.height()) } else { (vr_rect.width(), vr_rect.width()/a) };
+                let left = vr_rect.left() + (vr_rect.width() - dw) / 2.0;
+                let top = vr_rect.top() + (vr_rect.height() - dh) / 2.0;
+                let nx = (mouse_pos.x - left) / dw;
+                let ny = (mouse_pos.y - top) / dh;
+                
+                let new_ox = nx * vp.tex_size.0 as f32 - mouse_wx * new_scale;
+                let new_oy = mouse_wy * new_scale - ny * vp.tex_size.1 as f32;
+                
+                vp.view_offset = (new_ox, new_oy);
             }
 
-            // Right-click pan - use ctx.input since Sense doesn't track secondary drag well
+            // Right-click pan
             let rc_down = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
             let rc_clicked = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary));
             if rc_clicked && in_viewport {
@@ -1047,10 +1081,11 @@ impl EP {
             }
             if rc_down && self.panning {
                 if let Some(start) = self.pan_start {
-                    let dx = (mouse_pos.x - start.x) * (vp.tex_size.0 as f32 / vr_rect.width()) / vp.view_scale;
-                    let dy = (mouse_pos.y - start.y) * (vp.tex_size.1 as f32 / vr_rect.height()) / vp.view_scale;
-                    // Fix 6: both axes inverted — Godot/Unity style
-                    vp.view_offset = (self.pan_offset_start.0 - dx, self.pan_offset_start.1 - dy);
+                    let a = vp.tex_size.0 as f32 / vp.tex_size.1 as f32;
+                    let (dw, dh) = if vr_rect.width()/vr_rect.height() > a { (vr_rect.height()*a, vr_rect.height()) } else { (vr_rect.width(), vr_rect.width()/a) };
+                    let dx = (mouse_pos.x - start.x) * (vp.tex_size.0 as f32 / dw);
+                    let dy = (mouse_pos.y - start.y) * (vp.tex_size.1 as f32 / dh);
+                    vp.view_offset = (self.pan_offset_start.0 + dx, self.pan_offset_start.1 - dy);
                 }
             }
             if !rc_down { self.panning = false; }
@@ -1059,15 +1094,14 @@ impl EP {
             let lc = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
             let ld = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
             
-            // Tilemap painting mode - FIXED: use viewport's screen_to_world which accounts for offset/scale
+            // Tilemap painting mode
             if self.tab == Tab::Tilemap && in_viewport {
                 if ld {
                     let (wx, wy) = self.screen_to_world(mouse_pos, &vr_rect, vp);
                     let ts = vp.tile_layers.first().map(|l| l.ts as f32).unwrap_or(16.0);
-                    let col = ((wx) / ts).floor() as i32;
-                    let row = ((wy) / ts).floor() as i32;
+                    let col = (wx / ts).floor() as i32;
+                    let row = (wy / ts).floor() as i32;
                     if col >= 0 && row >= 0 {
-                        // Paint on first visible layer
                         if let Some(layer) = vp.tile_layers.iter_mut().find(|l| l.vis) {
                             if (row as usize) < layer.rows && (col as usize) < layer.cols {
                                 layer.tiles[row as usize][col as usize] = vp.sel_tile as u32;
@@ -1077,7 +1111,6 @@ impl EP {
                 }
             } else if lc && in_viewport {
                 let (wx, wy) = self.screen_to_world(mouse_pos, &vr_rect, vp);
-                // Check gizmo hit first if entity selected
                 let mut hit_gizmo = false;
                 if let Some(sel) = vp.selected {
                     if let Some((cx, cy)) = self.get_gizmo_center(vp) {
@@ -1108,8 +1141,15 @@ impl EP {
                     let (wx, wy) = self.screen_to_world(mouse_pos, &vr_rect, vp);
                     let (start_wx, start_wy) = vp.gizmo_drag_start_world.unwrap_or((wx, wy));
                     let (start_x, start_y, start_rot) = vp.gizmo_drag_start_value.unwrap_or((0.0,0.0,0.0));
-                    let dx = wx - start_wx;
-                    let dy = wy - start_wy;
+                    let mut dx = wx - start_wx;
+                    let mut dy = wy - start_wy;
+                    
+                    if vp.snap_to_grid {
+                        let gs = vp.grid_size.max(1) as f32;
+                        dx = (dx / gs).round() * gs;
+                        dy = (dy / gs).round() * gs;
+                    }
+                    
                     if let Some(mut t) = vp.world.get_mut::<Transform>(sel) {
                         match vp.transform_mode {
                             TransformMode::Move => {
@@ -1143,14 +1183,13 @@ impl EP {
                 let a = vp.tex_size.0 as f32 / vp.tex_size.1 as f32;
                 let (dw, dh) = if vr_rect.width()/vr_rect.height() > a { (vr_rect.height()*a, vr_rect.height()) } else { (vr_rect.width(), vr_rect.width()/a) };
                 let dr = egui::Rect::from_min_size(egui::pos2(vr_rect.left()+(vr_rect.width()-dw)/2.0, vr_rect.top()+(vr_rect.height()-dh)/2.0), egui::vec2(dw, dh));
-                ui.painter().rect_filled(vr_rect, 0.0, Color32::from_rgb(10,10,10));
+                
+                ui.painter().rect_filled(vr_rect, 0.0, Color32::from_rgb(14, 16, 20));
                 ui.painter().image(tid, dr, egui::Rect::from_min_max(egui::pos2(0.0,0.0), egui::pos2(1.0,1.0)), Color32::WHITE);
                 
-                // Drag-and-drop: accept textures dropped on viewport to assign to selected entity
-                let drop_accepted = ui.ui_contains_pointer() && ui.input(|i| i.pointer.any_down());
+                // Drag-and-drop textures
                 if let Some(dropped_tex) = vp.drag_tex_id {
                     if in_viewport && lc {
-                        // Assign dropped texture to selected entity's sprite
                         if let Some(sel) = vp.selected {
                             vp.save_undo();
                             if let Some(mut sp) = vp.world.get_mut::<Sprite>(sel) {
@@ -1158,7 +1197,6 @@ impl EP {
                                 if let Some((_, tw, th, _)) = vp.textures.get(&dropped_tex) {
                                     sp.source_width = *tw;
                                     sp.source_height = *th;
-                                    // Auto-detect spritesheet if not already configured
                                     if !vp.spritesheet_info.contains_key(&dropped_tex) {
                                         let auto_tile = crate::viewport::auto_tile_size(*tw, *th);
                                         let si = crate::viewport::SpritesheetInfo::new(*tw, *th, auto_tile, auto_tile);
@@ -1169,14 +1207,146 @@ impl EP {
                                         }
                                     }
                                 }
-                                vp.lua_log.push(format!("[asset] assigned texture to entity"));
+                                vp.lua_log.push("[asset] assigned texture to entity".to_string());
                             }
                         }
                         vp.drag_tex_id = None;
                     }
                 }
                 
-                // Draw gizmo overlay on selected entity
+                // Canvas painter clipped to texture display area
+                let canvas_painter = ui.painter_at(dr.intersect(vr_rect));
+
+                // 1. GRID OVERLAY
+                let grid_size = if vp.tile_layers.first().map(|l| l.ts).unwrap_or(0) > 0 {
+                    vp.tile_layers.first().unwrap().ts as f32
+                } else {
+                    vp.grid_size.max(4) as f32
+                };
+
+                if vp.show_grid {
+                    let grid_color = Color32::from_rgba_unmultiplied(120, 140, 160, 50);
+                    let (w_left, w_top) = self.screen_to_world(dr.min, &vr_rect, vp);
+                    let (w_right, w_bottom) = self.screen_to_world(dr.max, &vr_rect, vp);
+
+                    let start_x = (w_left / grid_size).floor() * grid_size;
+                    let mut gx = start_x;
+                    while gx <= w_right + grid_size {
+                        let sp = self.world_to_screen(gx, 0.0, &vr_rect, vp);
+                        if sp.x >= dr.left() && sp.x <= dr.right() {
+                            canvas_painter.line_segment(
+                                [egui::pos2(sp.x, dr.top()), egui::pos2(sp.x, dr.bottom())],
+                                (1.0, grid_color),
+                            );
+                        }
+                        gx += grid_size;
+                    }
+
+                    let start_y = (w_top / grid_size).floor() * grid_size;
+                    let mut gy = start_y;
+                    while gy <= w_bottom + grid_size {
+                        let sp = self.world_to_screen(0.0, gy, &vr_rect, vp);
+                        if sp.y >= dr.top() && sp.y <= dr.bottom() {
+                            canvas_painter.line_segment(
+                                [egui::pos2(dr.left(), sp.y), egui::pos2(dr.right(), sp.y)],
+                                (1.0, grid_color),
+                            );
+                        }
+                        gy += grid_size;
+                    }
+                }
+
+                // 2. VISIBLE X AND Y AXES (VIBRANT & ALWAYS VISIBLE)
+                // X Axis: Horizontal Red line through Y=0
+                // Y Axis: Vertical Green line through X=0
+                let origin_sp = self.world_to_screen(0.0, 0.0, &vr_rect, vp);
+
+                // Horizontal X-Axis (Y=0)
+                if origin_sp.y >= dr.top() && origin_sp.y <= dr.bottom() {
+                    canvas_painter.line_segment(
+                        [egui::pos2(dr.left(), origin_sp.y), egui::pos2(dr.right(), origin_sp.y)],
+                        (3.5, Color32::from_black_alpha(200)),
+                    );
+                    canvas_painter.line_segment(
+                        [egui::pos2(dr.left(), origin_sp.y), egui::pos2(dr.right(), origin_sp.y)],
+                        (2.0, Color32::from_rgb(255, 68, 68)),
+                    );
+                    let arrow_x = dr.right() - 25.0;
+                    canvas_painter.text(
+                        egui::pos2(arrow_x, origin_sp.y - 12.0),
+                        egui::Align2::RIGHT_BOTTOM,
+                        "+X ▶",
+                        egui::TextStyle::Small.resolve(ui.style()),
+                        Color32::from_rgb(255, 140, 140),
+                    );
+                }
+
+                // Vertical Y-Axis (X=0)
+                if origin_sp.x >= dr.left() && origin_sp.x <= dr.right() {
+                    canvas_painter.line_segment(
+                        [egui::pos2(origin_sp.x, dr.top()), egui::pos2(origin_sp.x, dr.bottom())],
+                        (3.5, Color32::from_black_alpha(200)),
+                    );
+                    canvas_painter.line_segment(
+                        [egui::pos2(origin_sp.x, dr.top()), egui::pos2(origin_sp.x, dr.bottom())],
+                        (2.0, Color32::from_rgb(68, 255, 68)),
+                    );
+                    let arrow_y = dr.bottom() - 25.0;
+                    canvas_painter.text(
+                        egui::pos2(origin_sp.x + 8.0, arrow_y),
+                        egui::Align2::LEFT_BOTTOM,
+                        "+Y ▼",
+                        egui::TextStyle::Small.resolve(ui.style()),
+                        Color32::from_rgb(140, 255, 140),
+                    );
+                }
+
+                // Origin Marker (0,0)
+                if origin_sp.x >= dr.left() && origin_sp.x <= dr.right() &&
+                   origin_sp.y >= dr.top() && origin_sp.y <= dr.bottom() {
+                    canvas_painter.circle_filled(origin_sp, 6.0, Color32::BLACK);
+                    canvas_painter.circle_filled(origin_sp, 4.5, Color32::from_rgb(255, 220, 0));
+                    canvas_painter.circle_filled(origin_sp, 2.0, Color32::BLACK);
+                    
+                    let badge_rect = egui::Rect::from_min_size(
+                        egui::pos2(origin_sp.x + 8.0, origin_sp.y - 18.0),
+                        egui::vec2(36.0, 16.0),
+                    );
+                    canvas_painter.rect_filled(badge_rect, 3.0, Color32::from_black_alpha(200));
+                    canvas_painter.rect_stroke(badge_rect, 3.0, egui::Stroke::new(1.0_f32, Color32::from_rgb(255, 220, 0)), egui::StrokeKind::Outside);
+                    canvas_painter.text(
+                        badge_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "(0,0)",
+                        egui::TextStyle::Small.resolve(ui.style()),
+                        Color32::WHITE,
+                    );
+                }
+
+                // 3. CORNER VIEWPORT ORIENTATION GIZMO (Bottom-Right corner)
+                // Always visible so you know axis orientations!
+                let corner_center = egui::pos2(dr.right() - 40.0, dr.bottom() - 40.0);
+                let gizmo_bg = egui::Rect::from_center_size(corner_center, egui::vec2(60.0, 60.0));
+                canvas_painter.rect_filled(gizmo_bg, 8.0, Color32::from_black_alpha(180));
+                canvas_painter.rect_stroke(gizmo_bg, 8.0, egui::Stroke::new(1.0_f32, Color32::from_rgb(60, 70, 90)), egui::StrokeKind::Outside);
+
+                let axis_len = 18.0;
+                let x_end = egui::pos2(corner_center.x + axis_len, corner_center.y);
+                let y_end = egui::pos2(corner_center.x, corner_center.y + axis_len);
+
+                // Red X vector
+                canvas_painter.line_segment([corner_center, x_end], (2.5, Color32::from_rgb(255, 75, 75)));
+                canvas_painter.circle_filled(x_end, 3.0, Color32::from_rgb(255, 75, 75));
+                canvas_painter.text(egui::pos2(x_end.x + 6.0, x_end.y), egui::Align2::LEFT_CENTER, "X", egui::TextStyle::Small.resolve(ui.style()), Color32::from_rgb(255, 150, 150));
+
+                // Green Y vector
+                canvas_painter.line_segment([corner_center, y_end], (2.5, Color32::from_rgb(75, 255, 75)));
+                canvas_painter.circle_filled(y_end, 3.0, Color32::from_rgb(75, 255, 75));
+                canvas_painter.text(egui::pos2(y_end.x, y_end.y + 6.0), egui::Align2::CENTER_TOP, "Y", egui::TextStyle::Small.resolve(ui.style()), Color32::from_rgb(150, 255, 150));
+
+                canvas_painter.circle_filled(corner_center, 3.0, Color32::WHITE);
+                
+                // Draw transform gizmo overlay on selected entity
                 if let Some((cx, cy)) = self.get_gizmo_center(vp) {
                     let gizmo_scale = vp.view_scale.max(0.5);
                     let len = 20.0 * gizmo_scale;
@@ -1185,17 +1355,17 @@ impl EP {
                     let ey = self.world_to_screen(cx, cy + len / vp.view_scale, &vr_rect, vp);
                     match vp.transform_mode {
                         TransformMode::Move => {
-                            ui.painter().line_segment([c, ex], (2.0, Color32::RED));
-                            ui.painter().line_segment([c, ey], (2.0, Color32::GREEN));
-                            ui.painter().circle_filled(ex, 3.0, Color32::RED);
-                            ui.painter().circle_filled(ey, 3.0, Color32::GREEN);
-                            ui.painter().rect_filled(egui::Rect::from_center_size(c, egui::vec2(6.0, 6.0)), 0.0, Color32::from_rgb(200, 200, 200));
+                            canvas_painter.line_segment([c, ex], (2.0, Color32::RED));
+                            canvas_painter.line_segment([c, ey], (2.0, Color32::GREEN));
+                            canvas_painter.circle_filled(ex, 3.0, Color32::RED);
+                            canvas_painter.circle_filled(ey, 3.0, Color32::GREEN);
+                            canvas_painter.rect_filled(egui::Rect::from_center_size(c, egui::vec2(6.0, 6.0)), 0.0, Color32::from_rgb(200, 200, 200));
                         }
                         TransformMode::Scale => {
-                            ui.painter().line_segment([c, ex], (2.0, Color32::RED));
-                            ui.painter().line_segment([c, ey], (2.0, Color32::GREEN));
-                            ui.painter().rect_filled(egui::Rect::from_center_size(ex, egui::vec2(6.0, 6.0)), 0.0, Color32::RED);
-                            ui.painter().rect_filled(egui::Rect::from_center_size(ey, egui::vec2(6.0, 6.0)), 0.0, Color32::GREEN);
+                            canvas_painter.line_segment([c, ex], (2.0, Color32::RED));
+                            canvas_painter.line_segment([c, ey], (2.0, Color32::GREEN));
+                            canvas_painter.rect_filled(egui::Rect::from_center_size(ex, egui::vec2(6.0, 6.0)), 0.0, Color32::RED);
+                            canvas_painter.rect_filled(egui::Rect::from_center_size(ey, egui::vec2(6.0, 6.0)), 0.0, Color32::GREEN);
                         }
                         TransformMode::Rotate => {
                             let ex2 = self.world_to_screen(cx + len / vp.view_scale, cy, &vr_rect, vp);
@@ -1205,109 +1375,17 @@ impl EP {
                                 self.world_to_screen(cx + len/vp.view_scale * ang.cos(), cy + len/vp.view_scale * ang.sin(), &vr_rect, vp)
                             }).collect();
                             for w in pts.windows(2) {
-                                ui.painter().line_segment([w[0], w[1]], (2.0, Color32::from_rgb(100, 200, 255)));
+                                canvas_painter.line_segment([w[0], w[1]], (2.0, Color32::from_rgb(100, 200, 255)));
                             }
-                            ui.painter().circle_filled(ex2, 4.0, Color32::from_rgb(100, 200, 255));
+                            canvas_painter.circle_filled(ex2, 4.0, Color32::from_rgb(100, 200, 255));
                         }
                     }
-                }
-
-                // Grid overlay - show grid lines and coordinate axes
-                // Grid settings - use tile size for alignment
-                let tile_size = vp.tile_layers.first().map(|l| l.ts as f32).unwrap_or(16.0);
-                let grid_spacing = tile_size.max(16.0); // Use tile size for perfect alignment
-                let grid_color = Color32::from_rgba_unmultiplied(100, 100, 100, 120); // Medium gray, semi-transparent
-                let axis_color_x = Color32::from_rgb(255, 100, 100); // Bright red
-                let axis_color_y = Color32::from_rgb(100, 255, 100); // Bright green
-                let coord_color = Color32::from_rgb(255, 255, 255); // White for better visibility
-                let axis_width = 2.5;
-
-                // Calculate visible world bounds
-                let world_left = (vp.view_offset.0 / vp.view_scale).max(-1000.0);
-                let world_right = ((vp.view_offset.0 + dw) / vp.view_scale).min(1000.0);
-                let world_top = (-vp.view_offset.1 / vp.view_scale).max(-1000.0);
-                let world_bottom = ((-vp.view_offset.1 + dh) / vp.view_scale).min(1000.0);
-
-                // Draw vertical grid lines (lines of constant X)
-                // Align to grid spacing for perfect tile alignment
-                let start_x = (world_left / grid_spacing).floor() * grid_spacing;
-                let mut x = start_x;
-                while x <= world_right {
-                    let screen_pos = self.world_to_screen(x, 0.0, &vr_rect, vp);
-                    if screen_pos.x >= vr_rect.left() && screen_pos.x <= vr_rect.right() {
-                        // Check if this is the Y=0 axis line (X=0)
-                        if (x - 0.0).abs() < 0.5 {
-                            // Y-axis (X=0) - thicker, brighter line
-                            ui.painter().line_segment([
-                                egui::Pos2::new(screen_pos.x, vr_rect.top() + 20.0),
-                                egui::Pos2::new(screen_pos.x, vr_rect.bottom() - 20.0)
-                            ], (axis_width, axis_color_x));
-                        } else {
-                            // Regular grid line
-                            ui.painter().line_segment([
-                                egui::Pos2::new(screen_pos.x, vr_rect.top()),
-                                egui::Pos2::new(screen_pos.x, vr_rect.bottom())
-                            ], (1.0, grid_color));
-                        }
-                        // Draw X coordinate label (only if near top)
-                        let label = format!("{:.0}", x);
-                        ui.painter().text(egui::pos2(screen_pos.x, vr_rect.top() + 5.0), 
-                            egui::Align2::CENTER_TOP, label, egui::TextStyle::Small.resolve(ui.style()), coord_color);
-                    }
-                    x += grid_spacing;
-                }
-
-                // Draw horizontal grid lines (lines of constant Y)
-                let start_y = (world_top / grid_spacing).floor() * grid_spacing;
-                let mut y = start_y;
-                while y <= world_bottom {
-                    let screen_pos = self.world_to_screen(0.0, y, &vr_rect, vp);
-                    if screen_pos.y >= vr_rect.top() && screen_pos.y <= vr_rect.bottom() {
-                        // Check if this is the X=0 axis line (Y=0)
-                        if (y - 0.0).abs() < 0.5 {
-                            // X-axis (Y=0) - thicker, brighter line
-                            ui.painter().line_segment([
-                                egui::Pos2::new(vr_rect.left() + 20.0, screen_pos.y),
-                                egui::Pos2::new(vr_rect.right() - 20.0, screen_pos.y)
-                            ], (axis_width, axis_color_y));
-                        } else {
-                            // Regular grid line
-                            ui.painter().line_segment([
-                                egui::Pos2::new(vr_rect.left(), screen_pos.y),
-                                egui::Pos2::new(vr_rect.right(), screen_pos.y)
-                            ], (1.0, grid_color));
-                        }
-                        // Draw Y coordinate label (only if near left)
-                        let label = format!("{:.0}", y);
-                        ui.painter().text(egui::pos2(5.0, screen_pos.y), 
-                            egui::Align2::LEFT_CENTER, label, egui::TextStyle::Small.resolve(ui.style()), coord_color);
-                    }
-                    y += grid_spacing;
-                }
-
-                // Draw origin marker (0,0) - intersection of axes
-                let origin_screen = self.world_to_screen(0.0, 0.0, &vr_rect, vp);
-                if origin_screen.x >= vr_rect.left() && origin_screen.x <= vr_rect.right() &&
-                   origin_screen.y >= vr_rect.top() && origin_screen.y <= vr_rect.bottom() {
-                    // Cross marker at origin with thicker lines
-                    let size = 10.0;
-                    ui.painter().line_segment([
-                        egui::Pos2::new(origin_screen.x - size, origin_screen.y),
-                        egui::Pos2::new(origin_screen.x + size, origin_screen.y)
-                    ], (3.0, Color32::YELLOW));
-                    ui.painter().line_segment([
-                        egui::Pos2::new(origin_screen.x, origin_screen.y - size),
-                        egui::Pos2::new(origin_screen.x, origin_screen.y + size)
-                    ], (3.0, Color32::YELLOW));
-                    // Origin label
-                    ui.painter().text(egui::pos2(origin_screen.x + 15.0, origin_screen.y - 15.0), 
-                        egui::Align2::LEFT_TOP, "0,0", egui::TextStyle::Small.resolve(ui.style()), Color32::YELLOW);
                 }
 
                 // Info overlay
                 let info = format!("{}x{} @ {:.0}% | {:?}", vp.tex_size.0, vp.tex_size.1, (dw / vp.tex_size.0 as f32) * 100.0, vp.transform_mode);
-                ui.painter().text(egui::pos2(vr_rect.left()+4.0, vr_rect.top()+4.0), egui::Align2::LEFT_TOP, 
-                    info, egui::TextStyle::Body.resolve(ui.style()), Color32::WHITE.linear_multiply(0.6));
+                canvas_painter.text(egui::pos2(dr.left()+6.0, dr.top()+6.0), egui::Align2::LEFT_TOP, 
+                    info, egui::TextStyle::Body.resolve(ui.style()), Color32::WHITE.linear_multiply(0.8));
             } else { 
                 ui.painter().rect_filled(vr_rect, 0.0, Color32::from_rgb(20,20,30));
                 ui.weak("(No render target)");

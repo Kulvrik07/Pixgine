@@ -2,7 +2,7 @@ use anyhow::Result;
 use bevy_ecs::prelude::*;
 use pixgine_engine::core::VirtualResolution;
 use pixgine_engine::ecs::*;
-use pixgine_engine::ecs::{Transform, Sprite, Physics, Animation, Velocity, ParticleEmitter, Particle, AudioSource, Parent, Children, CameraTag};
+use pixgine_engine::ecs::{Transform, Sprite, Physics, Animation, Velocity, ParticleEmitter, AudioSource, Parent, Children, CameraTag};
 use pixgine_engine::input::InputManager;
 use pixgine_engine::scene::{Scene, spawn_scene, serialize_world, SceneDescriptor, TilemapData, TileLayerData};
 use pixgine_engine::physics::PhysicsWorld;
@@ -98,6 +98,11 @@ pub struct VP {
     pub drag_tex_name: Option<String>,
     // build/export
     pub export_path: Option<PathBuf>,
+    // grid & viewport settings
+    pub show_grid: bool,
+    pub snap_to_grid: bool,
+    pub grid_size: u32,
+    pub pixel_perfect: bool,
 }
 
 /// Snapshot of entire world state for undo/redo
@@ -251,6 +256,10 @@ impl VP {
             export_path: None,
             tilesheet_path: None,
             egui_renderer: None,
+            show_grid: true,
+            snap_to_grid: false,
+            grid_size: 16,
+            pixel_perfect: true,
         })
     }
 
@@ -603,7 +612,7 @@ impl VP {
         self.refresh();
         
         // Name entities from the descriptor
-        let mut ei = self.entities.clone();
+        let ei = self.entities.clone();
         for (i, ed) in descriptor.entities.iter().enumerate() {
             if i < ei.len() {
                 self.entity_names.insert(ei[i].entity, ed.name.clone());
@@ -860,21 +869,59 @@ impl VP {
             if !sp.visible { continue; }
             let tid = sp.texture_id.unwrap_or(0);
             let b = batches.entry(tid).or_default();
-            let (sw, sh) = (if sp.source_width > 0 { sp.source_width as f32 } else { 16.0 } * tr.scale_x,
-                            if sp.source_height > 0 { sp.source_height as f32 } else { 16.0 } * tr.scale_y);
+
+            let (base_w, base_h) = if sp.source_width > 0 && sp.source_height > 0 {
+                (sp.source_width as f32, sp.source_height as f32)
+            } else if let Some((_, tw, th, _)) = self.textures.get(&tid) {
+                (*tw as f32, *th as f32)
+            } else {
+                (16.0, 16.0)
+            };
+
+            let sw = base_w * tr.scale_x;
+            let sh = base_h * tr.scale_y;
             let cos = tr.rotation.cos();
             let sin = tr.rotation.sin();
-            let hw = sw/2.0; let hh = sh/2.0;
+            let hw = sw / 2.0;
+            let hh = sh / 2.0;
             let corners = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)];
-            let uvs = if sp.flip_x { [(1.0,0.0),(0.0,0.0),(0.0,1.0),(1.0,1.0)] } else { [(0.0,0.0),(1.0,0.0),(1.0,1.0),(0.0,1.0)] };
-            let uvs = if sp.flip_y { [(uvs[0].0,1.0-uvs[0].1),(uvs[1].0,1.0-uvs[1].1),(uvs[2].0,1.0-uvs[2].1),(uvs[3].0,1.0-uvs[3].1)] } else { uvs };
+
+            // Compute precise UV coordinates from source rect
+            let (u0, v0, u1, v1) = if tid != 0 {
+                if let Some((_, tw, th, _)) = self.textures.get(&tid) {
+                    let tw_f = *tw as f32;
+                    let th_f = *th as f32;
+                    let u0 = if sp.source_width > 0 { sp.source_x as f32 / tw_f } else { 0.0 };
+                    let v0 = if sp.source_height > 0 { sp.source_y as f32 / th_f } else { 0.0 };
+                    let u1 = if sp.source_width > 0 { (sp.source_x + sp.source_width) as f32 / tw_f } else { 1.0 };
+                    let v1 = if sp.source_height > 0 { (sp.source_y + sp.source_height) as f32 / th_f } else { 1.0 };
+                    (u0, v0, u1, v1)
+                } else {
+                    (0.0, 0.0, 1.0, 1.0)
+                }
+            } else {
+                (0.0, 0.0, 1.0, 1.0)
+            };
+
+            let (left_u, right_u) = if sp.flip_x { (u1, u0) } else { (u0, u1) };
+            let (top_v, bottom_v) = if sp.flip_y { (v1, v0) } else { (v0, v1) };
+            let uvs = [(left_u, top_v), (right_u, top_v), (right_u, bottom_v), (left_u, bottom_v)];
+
+            let pos_x = if self.pixel_perfect { tr.x.round() } else { tr.x };
+            let pos_y = if self.pixel_perfect { tr.y.round() } else { tr.y };
+
             let i = b.verts.len() as u32;
             for (j, &(lx, ly)) in corners.iter().enumerate() {
-                let rx = lx*cos - ly*sin;
-                let ry = lx*sin + ly*cos;
-                b.verts.push(SV { pos: [tr.x+rx, tr.y+ry], uv: [uvs[j].0, uvs[j].1], color: sp.color, layer: sp.layer as f32 });
+                let rx = lx * cos - ly * sin;
+                let ry = lx * sin + ly * cos;
+                b.verts.push(SV {
+                    pos: [pos_x + rx, pos_y + ry],
+                    uv: [uvs[j].0, uvs[j].1],
+                    color: sp.color,
+                    layer: sp.layer as f32,
+                });
             }
-            b.idxs.extend(&[i,i+1,i+2,i,i+2,i+3]);
+            b.idxs.extend(&[i, i + 1, i + 2, i, i + 2, i + 3]);
         }
 
         // Selection outline on selected entity (only if it has a visible sprite)
@@ -934,7 +981,7 @@ impl VP {
         }
 
         // Particle rendering - render each particle as a small colored quad
-        for (emitter, tr) in self.world.query::<(&ParticleEmitter, &Transform)>().iter(&self.world) {
+        for (emitter, _tr) in self.world.query::<(&ParticleEmitter, &Transform)>().iter(&self.world) {
             let b = batches.entry(0).or_default();
             for p in &emitter.particles {
                 let sz = p.size;
