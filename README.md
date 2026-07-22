@@ -1,71 +1,71 @@
 # Pixgine
 
-**Pixgine** ist ein moderner 2D-Game-Engine in Rust entwickelt.
+**Pixgine** is a modern 2D game engine written in Rust.
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)](https://github.com/Kulvrik07/Pixgine)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## 🚧 Work in Progress
+## Work in Progress
 
-Dieses Projekt ist in Aktiventwicklung. Erwartet keine vollständige Funktionalität oder stabile API.
+This project is under active development. Don't expect full functionality or a stable API yet.
 
-## 📦 Projektstruktur
+## Project Structure
 
 ```
 Pixgine/
-├── engine/     # Kern-Game-Engine (ECS, Rendering, Physics, Audio)
-├── editor/     # Visual Editor für Level- und Asset-Management
-├── game/       # Beispiel-Game als Demo
-└── assets/     # Texturen, Tilesets, Szenen, Skripte
+├── engine/     # Core game engine (ECS, rendering, physics, audio)
+├── editor/     # Visual editor for level and asset management
+├── game/       # Example game as a demo
+└── assets/     # Textures, tilesets, scenes, scripts
 ```
 
-## 🚀 Features (geplant)
+## Features (planned)
 
-- **ECS-Architektur** (Entity-Component-System)
-- **2D-Rendering** mit wgpu
-- **Physik** (Kollision, Bewegung)
-- **Audio-System**
-- **Scripting** (via WASM oder Lua)
-- **Visual Editor** (in Entwicklung)
+- ECS architecture (Entity-Component-System)
+- 2D rendering with wgpu
+- Physics (collision, movement)
+- Audio system
+- Scripting (via WASM or Lua)
+- Visual editor (in development)
 
-## 🛠️ Technologien
+## Technologies
 
-- **Sprache:** Rust
+- **Language:** Rust
 - **Rendering:** wgpu
 - **UI:** egui
-- **Build-System:** Cargo
+- **Build system:** Cargo
 
-## 📚 Nutzung
+## Usage
 
-### Engine bauen
+### Building the engine
 
 ```bash
 cd engine
 cargo build
 ```
 
-### Editor bauen
+### Building the editor
 
 ```bash
 cd editor
 cargo build
 ```
 
-### Beispiel-Game starten
+### Running the example game
 
 ```bash
 cd game
 cargo run
 ```
 
-## 📝 Lizenz
+## License
 
-Dieses Projekt ist unter der MIT-Lizenz lizenziert.
+This project is licensed under the MIT License.
 
-## 🤝 Beiträge
+## Contributing
 
-Beiträge sind willkommen! Bitte Issues öffnen, bevor du große Änderungen vornimmst.
+Contributions are welcome. Please open an issue before making any large changes.
 
 ---
 
-*Entwickelt mit ❤️ in Rust*
+Built with love, in Rust.
