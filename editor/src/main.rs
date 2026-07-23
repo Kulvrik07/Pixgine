@@ -3,10 +3,32 @@ use std::sync::Arc; use anyhow::Result;
 use winit::application::ApplicationHandler;
 use winit::event::*; use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::PhysicalKey; use winit::window::{Window, WindowId};
-use egui::ViewportId; use egui_wgpu::winit::Painter; use egui_winit::State as EWS;
+use egui::{ViewportId, Visuals, Stroke, Color32};
+use egui_wgpu::winit::Painter; use egui_winit::State as EWS;
 use panels::EP; use viewport::VP;
 
 struct App { w: Option<Arc<Window>>, es: Option<EWS>, p: Option<Painter>, ctx: Option<egui::Context>, vp: Option<VP>, tex: Option<egui::TextureId>, ep: EP }
+
+/// Build a polished dark theme for the editor UI.
+fn setup_theme(ctx: &egui::Context) {
+    let mut visuals = Visuals::dark();
+    visuals.override_text_color = Some(Color32::from_rgb(220, 225, 235));
+    visuals.window_corner_radius = egui::CornerRadius::same(8);
+    visuals.panel_fill = Color32::from_rgb(22, 25, 32);
+    visuals.window_fill = Color32::from_rgb(26, 30, 38);
+    visuals.button_frame = false;
+    // Widget colors
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(55, 60, 70));
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(80, 140, 210));
+    ctx.set_visuals(visuals);
+
+    // Text styles — slightly larger for readability
+    let mut style = (*ctx.style()).clone();
+    style.text_styles.insert(egui::TextStyle::Body, egui::FontId::new(13.0, egui::FontFamily::Proportional));
+    style.text_styles.insert(egui::TextStyle::Small, egui::FontId::new(11.0, egui::FontFamily::Proportional));
+    style.text_styles.insert(egui::TextStyle::Button, egui::FontId::new(12.0, egui::FontFamily::Proportional));
+    ctx.set_style(style);
+}
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
@@ -16,6 +38,7 @@ impl ApplicationHandler for App {
         let wa = Window::default_attributes().with_title("Pixgine Editor").with_inner_size(winit::dpi::PhysicalSize::new(1280, 720));
         let win = Arc::new(el.create_window(wa).unwrap());
         let ctx = egui::Context::default(); ctx.set_pixels_per_point(1.0);
+        setup_theme(&ctx);
         let es = EWS::new(ctx.clone(), ViewportId::ROOT, &win, None, None, None);
         let mut p = pollster::block_on(Painter::new(ctx.clone(), egui_wgpu::WgpuConfiguration::default(), 1, None, false, false));
         pollster::block_on(p.set_window(ViewportId::ROOT, Some(win.clone()))).unwrap();
@@ -40,10 +63,14 @@ impl ApplicationHandler for App {
                 let ri = es.take_egui_input(w);
                 let fo = ctx.run(ri, |egui_ctx| { if let Some(ref mut vp) = self.vp { self.ep.show(egui_ctx, vp); } });
                 let c = ctx.tessellate(fo.shapes, ctx.pixels_per_point());
-                p.paint_and_update_textures(ViewportId::ROOT, ctx.pixels_per_point(), [0.15,0.15,0.15,1.0], &c, &fo.textures_delta, vec![]);
+                p.paint_and_update_textures(ViewportId::ROOT, ctx.pixels_per_point(), [0.08,0.09,0.12,1.0], &c, &fo.textures_delta, vec![]);
             }
             WindowEvent::KeyboardInput { event: KeyEvent { physical_key: PhysicalKey::Code(k), state, .. }, .. } => {
                 if state == ElementState::Pressed {
+                    // Check Ctrl modifier from egui context before borrowing vp
+                    let ctrl = self.ctx.as_ref()
+                        .map(|c| c.input(|i| i.modifiers.contains(egui::Modifiers::CTRL)))
+                        .unwrap_or(false);
                     if let Some(ref mut vp) = self.vp {
                         match k {
                             winit::keyboard::KeyCode::KeyW => {
@@ -62,12 +89,60 @@ impl ApplicationHandler for App {
                                 vp.paste_entity();
                             }
                             winit::keyboard::KeyCode::KeyZ => {
-                                // Undo/Redo with Ctrl
-                                // We check if Ctrl is held via another method
-                                vp.restore_undo();
+                                if ctrl { vp.restore_undo(); }
                             }
                             winit::keyboard::KeyCode::KeyY => {
-                                vp.restore_redo();
+                                if ctrl { vp.restore_redo(); }
+                            }
+                            winit::keyboard::KeyCode::KeyS => {
+                                if ctrl {
+                                    if let Some(p) = vp.scene_path.clone() { let _ = vp.save_scene(&p); }
+                                }
+                            }
+                            winit::keyboard::KeyCode::KeyO => {
+                                if ctrl { self.ep.show_open_file_dialog = true; }
+                            }
+                            winit::keyboard::KeyCode::Equal => {
+                                // Zoom in
+                                if vp.pixel_perfect {
+                                    let old = vp.view_scale;
+                                    if old >= 1.0 {
+                                        vp.view_scale = (old + 1.0).min(20.0);
+                                    } else {
+                                        let n = (1.0 / old).round().max(2.0);
+                                        vp.view_scale = (1.0 / (n - 1.0)).max(1.0);
+                                    }
+                                    vp.target_view_scale = vp.view_scale;
+                                } else {
+                                    vp.view_scale = (vp.view_scale * 1.25).min(20.0);
+                                    vp.target_view_scale = vp.view_scale;
+                                }
+                                vp.view_offset = (vp.view_offset.0.round(), vp.view_offset.1.round());
+                                vp.target_view_offset = vp.view_offset;
+                            }
+                            winit::keyboard::KeyCode::Minus => {
+                                // Zoom out
+                                if vp.pixel_perfect {
+                                    let old = vp.view_scale;
+                                    if old <= 1.0 {
+                                        let n = (1.0 / old).round().max(1.0);
+                                        vp.view_scale = (1.0 / (n + 1.0)).max(0.05);
+                                    } else {
+                                        vp.view_scale = (old - 1.0).max(1.0);
+                                    }
+                                    vp.target_view_scale = vp.view_scale;
+                                } else {
+                                    vp.view_scale = (vp.view_scale / 1.25).max(0.1);
+                                    vp.target_view_scale = vp.view_scale;
+                                }
+                                vp.view_offset = (vp.view_offset.0.round(), vp.view_offset.1.round());
+                                vp.target_view_offset = vp.view_offset;
+                            }
+                            winit::keyboard::KeyCode::Digit0 => {
+                                if ctrl {
+                                    vp.view_scale = 1.0; vp.view_offset = (0.0, 0.0);
+                                    vp.target_view_scale = 1.0; vp.target_view_offset = (0.0, 0.0);
+                                }
                             }
                             winit::keyboard::KeyCode::Delete | winit::keyboard::KeyCode::Backspace => {
                                 if let Some(e) = vp.selected { vp.remove(e); }

@@ -1,0 +1,14 @@
+tools:
+    shell:
+        allow:
+            - ls *
+            - find *
+            - head *
+            - sort
+            - cd *
+            - cargo check *
+            - tail *
+            - grep *
+paths:
+    allow:
+        - path: /Users/nils/Desktop/Pixgine/**

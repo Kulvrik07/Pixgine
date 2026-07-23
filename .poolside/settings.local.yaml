@@ -1,0 +1,13 @@
+tools:
+    shell:
+        allow:
+            - grep *
+            - cd *
+            - cargo build
+            - find *
+            - head *
+            - echo *
+            - ls *
+            - sort
+            - cargo check
+            - tail *

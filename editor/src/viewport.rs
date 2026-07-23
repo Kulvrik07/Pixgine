@@ -3,6 +3,7 @@ use bevy_ecs::prelude::*;
 use pixgine_engine::core::VirtualResolution;
 use pixgine_engine::ecs::*;
 use pixgine_engine::ecs::{Transform, Sprite, Physics, Animation, Velocity, ParticleEmitter, AudioSource, Parent, Children, CameraTag};
+use pixgine_engine::assets::{ImportSettings, TextureType};
 use pixgine_engine::input::InputManager;
 use pixgine_engine::scene::{Scene, spawn_scene, serialize_world, SceneDescriptor, TilemapData, TileLayerData};
 use pixgine_engine::physics::PhysicsWorld;
@@ -52,6 +53,10 @@ pub struct VP {
     pipeline: wgpu::RenderPipeline, ubuf: wgpu::Buffer, bg: wgpu::BindGroup,
     sampler: wgpu::Sampler, bgl: wgpu::BindGroupLayout,
     pub textures: HashMap<u64, (wgpu::TextureView, u32, u32, Option<egui::TextureId>)>, next_tex: u64, fallback_view: wgpu::TextureView,
+    /// Per-texture import settings (replaces the old global `texture_only_import` checkbox)
+    pub import_settings: HashMap<u64, ImportSettings>,
+    /// Maps texture ID → source file path (for re-import)
+    pub texture_paths: HashMap<u64, PathBuf>,
     pub egui_renderer: Option<Arc<egui::mutex::RwLock<Renderer>>>,
     /// Per-texture spritesheet slicing info (independent of tilemap)
     pub spritesheet_info: HashMap<u64, SpritesheetInfo>,
@@ -60,6 +65,9 @@ pub struct VP {
     pub sel_tex_id: Option<u64>,
     // viewport camera
     pub view_scale: f32, pub view_offset: (f32, f32),
+    /// Smooth-zoom targets — view_scale/offset lerp towards these each frame
+    /// when pixel_perfect is off, giving buttery-smooth camera motion.
+    pub target_view_scale: f32, pub target_view_offset: (f32, f32),
     pub ren_dev_queue: Option<(wgpu::Device, wgpu::Queue)>,
     // transform mode
     pub transform_mode: TransformMode,
@@ -96,8 +104,6 @@ pub struct VP {
     // drag-and-drop state
     pub drag_tex_id: Option<u64>,
     pub drag_tex_name: Option<String>,
-    /// Currently selected texture for preview window (tex_id, name, w, h)
-    pub selected_tex_preview: Option<(u64, String, u32, u32)>,
     // build/export
     pub export_path: Option<PathBuf>,
     // grid & viewport settings
@@ -118,6 +124,7 @@ pub struct UndoState {
     pub palette: Vec<(f32,f32,f32,f32)>,
 }
 
+#[derive(Clone)]
 pub struct RenCtx {
     pub dev: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -140,8 +147,8 @@ pub struct SpritesheetInfo {
 impl SpritesheetInfo {
     pub fn new(tex_w: u32, tex_h: u32, tile_w: u32, tile_h: u32) -> Self {
         Self {
-            cols: if tile_w > 0 { tex_w / tile_w } else { 1 },
-            rows: if tile_h > 0 { tex_h / tile_h } else { 1 },
+            cols: if tile_w > 0 { (tex_w / tile_w).max(1) } else { 1 },
+            rows: if tile_h > 0 { (tex_h / tile_h).max(1) } else { 1 },
             tile_w,
             tile_h,
             tex_w,
@@ -149,13 +156,22 @@ impl SpritesheetInfo {
         }
     }
     pub fn tile_count(&self) -> u32 { self.cols * self.rows }
+    /// Returns UV coordinates for the tile at `index`.
+    /// The index is clamped to the valid range so that out-of-range
+    /// values (e.g. a tile ID larger than the number of tiles in the
+    /// spritesheet) never cause a division-by-zero or out-of-bounds
+    /// panic — they simply fall back to the last valid tile.
     pub fn uv_for_tile(&self, index: u32) -> (f32, f32, f32, f32) {
-        let col = index % self.cols;
-        let row = index / self.cols;
-        let u0 = col as f32 / self.cols as f32;
-        let v0 = row as f32 / self.rows as f32;
-        let u1 = (col + 1) as f32 / self.cols as f32;
-        let v1 = (row + 1) as f32 / self.rows as f32;
+        let cols = self.cols.max(1);
+        let rows = self.rows.max(1);
+        let count = (cols * rows).max(1);
+        let clamped = index.min(count - 1);
+        let col = clamped % cols;
+        let row = clamped / cols;
+        let u0 = col as f32 / cols as f32;
+        let v0 = row as f32 / rows as f32;
+        let u1 = (col + 1) as f32 / cols as f32;
+        let v1 = (row + 1) as f32 / rows as f32;
         (u0, v0, u1, v1)
     }
 }
@@ -168,6 +184,27 @@ pub fn auto_tile_size(tw: u32, th: u32) -> u32 {
         }
     }
     16.min(tw).min(th)
+}
+
+/// Snap a scale value to the nearest *pixel-perfect* value.
+///
+/// For scales >= 1.0: rounds to the nearest integer (1×, 2×, 3× …) so every
+/// virtual pixel maps to a perfect integer block of render-target pixels.
+///
+/// For scales < 1.0: snaps to 1/n (½, ⅓, ¼ …) so every render-target pixel
+/// covers an integer number of world pixels — no interpolation, no blur.
+///
+/// This guarantees that at *any* zoom level every pixel stays the same crisp
+/// size, whether you are zoomed in or zoomed out.
+pub fn snap_pixel_perfect_scale(scale: f32) -> f32 {
+    if scale >= 1.0 {
+        scale.round().max(1.0)
+    } else if scale > 0.0 {
+        let n = (1.0 / scale).round().max(1.0);
+        1.0 / n
+    } else {
+        1.0
+    }
 }
 
 impl VP {
@@ -234,10 +271,12 @@ impl VP {
             ren_ctx: None, texture_map: HashMap::new(),
             pipeline, ubuf, bg, sampler: sam, bgl,
             textures: HashMap::new(), spritesheet_info: HashMap::new(), next_tex: 1, fallback_view: fv,
+            import_settings: HashMap::new(), texture_paths: HashMap::new(),
             tile_layers: vec![TL { name: "Ground".into(), vis: true, tiles: vec![vec![0;20];11], cols: 20, rows: 11, ts: 16, z_index: 0, spritesheet_tex_id: None }],
             sel_tile: 0, palette: vec![(0.3,0.6,0.3,1.0),(0.4,0.4,0.3,1.0),(0.5,0.5,0.6,1.0),(0.6,0.3,0.3,1.0)],
             anim_frame: 0, anim_timer: 0.0, scripts: Vec::new(),
             sel_tex_id: None, view_scale: 1.0, view_offset: (0.0,0.0),
+            target_view_scale: 1.0, target_view_offset: (0.0,0.0),
             ren_dev_queue: None, transform_mode: TransformMode::Move,
             gizmo_axis: GizmoAxis::None, gizmo_drag_start_world: None, gizmo_drag_start_value: None,
             png_thumbnails: HashMap::new(),
@@ -255,7 +294,6 @@ impl VP {
             audio_manager: None,
             drag_tex_id: None,
             drag_tex_name: None,
-            selected_tex_preview: None,
             export_path: None,
             tilesheet_path: None,
             egui_renderer: None,
@@ -453,9 +491,16 @@ impl VP {
     }
 
     /// Central helper: create a wgpu texture, register it with egui,
-    /// insert into textures map, and store default spritesheet info.
+    /// insert into textures map, and store import settings + spritesheet info.
     /// Returns the texture id.
-    pub fn import_and_slice_texture(&mut self, dev: &wgpu::Device, queue: &wgpu::Queue, bytes: &[u8], auto_slice: bool) -> Option<u64> {
+    pub fn import_and_slice_texture(
+        &mut self,
+        dev: &wgpu::Device,
+        queue: &wgpu::Queue,
+        bytes: &[u8],
+        settings: ImportSettings,
+        path: Option<PathBuf>,
+    ) -> Option<u64> {
         let img = image::load_from_memory(bytes).ok()?;
         let rgba = img.to_rgba8();
         let (w, h) = (img.width(), img.height());
@@ -479,20 +524,67 @@ impl VP {
         });
         self.textures.insert(id, (view, w, h, egui_tex_id));
 
-        // Always populate spritesheet_info — default = full-texture single tile
-        let (tile_w, tile_h) = if auto_slice {
-            let s = auto_tile_size(w, h);
-            (s, s)
-        } else {
-            (w, h)
+        // Store import settings and source path
+        self.import_settings.insert(id, settings.clone());
+        if let Some(p) = &path {
+            self.texture_paths.insert(id, p.clone());
+        }
+
+        // Compute spritesheet info from import settings
+        let (tile_w, tile_h) = match settings.texture_type {
+            TextureType::Texture => (w, h),
+            TextureType::Spritesheet => (settings.tile_width, settings.tile_height),
         };
         self.spritesheet_info.insert(id, SpritesheetInfo::new(w, h, tile_w, tile_h));
         Some(id)
     }
 
-    /// Legacy load_tex — forwards to import_and_slice_texture without auto-slice
+    /// Legacy load_tex — forwards to import_and_slice_texture with default settings
     pub fn load_tex(&mut self, dev: &wgpu::Device, queue: &wgpu::Queue, bytes: &[u8]) -> Option<u64> {
-        self.import_and_slice_texture(dev, queue, bytes, false)
+        self.import_and_slice_texture(dev, queue, bytes, ImportSettings::default(), None)
+    }
+
+    /// Re-import a texture with new import settings.
+    /// Reads the source file from disk and re-creates the GPU texture
+    /// with the updated slicing/filter configuration.
+    pub fn reimport_texture(&mut self, tex_id: u64, new_settings: ImportSettings) -> bool {
+        let path = match self.texture_paths.get(&tex_id).cloned() {
+            Some(p) => p,
+            None => return false,
+        };
+        let (dev, queue) = match &self.ren_ctx {
+            Some(rc) => (rc.dev.clone(), rc.queue.clone()),
+            None => return false,
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+
+        // Remove old texture data
+        self.textures.remove(&tex_id);
+        self.spritesheet_info.remove(&tex_id);
+
+        // Re-import with new settings — import_and_slice_texture will create
+        // a new entry with next_tex as the ID. We then move all data back
+        // to the original tex_id so existing sprite references stay valid.
+        match self.import_and_slice_texture(&dev, &queue, &bytes, new_settings, Some(path.clone())) {
+            Some(new_id) => {
+                // Decrement next_tex so the next import reuses this ID
+                self.next_tex = self.next_tex.saturating_sub(1);
+                // Move texture data back to original ID
+                let (view, w, h, egui_tex_id) = self.textures.remove(&new_id).unwrap();
+                self.textures.insert(tex_id, (view, w, h, egui_tex_id));
+                // Move import settings and spritesheet info back to original ID
+                let settings = self.import_settings.remove(&new_id).unwrap_or_default();
+                self.import_settings.insert(tex_id, settings);
+                let info = self.spritesheet_info.remove(&new_id).unwrap_or_else(|| SpritesheetInfo::new(w, h, w, h));
+                self.spritesheet_info.insert(tex_id, info);
+                self.texture_paths.insert(tex_id, path);
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn refresh(&mut self) {
@@ -803,13 +895,27 @@ impl VP {
 
         let (w, h) = (self.tex_size.0 as f32, self.tex_size.1 as f32);
 
+        // --- Smooth camera interpolation (non-pixel-perfect only) ---
+        // When pixel_perfect is off, smoothly lerp view_scale and view_offset
+        // towards their targets.  This gives a buttery, responsive camera feel
+        // without any jarring jumps.  In pixel-perfect mode we snap instantly
+        // so the pixel grid is always exact.
+        if !self.pixel_perfect {
+            let t = 0.18; // interpolation factor — higher = snappier
+            self.view_scale = self.view_scale + (self.target_view_scale - self.view_scale) * t;
+            self.view_offset.0 = self.view_offset.0 + (self.target_view_offset.0 - self.view_offset.0) * t;
+            self.view_offset.1 = self.view_offset.1 + (self.target_view_offset.1 - self.view_offset.1) * t;
+        }
+
         // --- Pixel-perfect: snap zoom and offset to integers ---
         // When pixel_perfect is enabled, view_scale snaps to the nearest
-        // integer (1x, 2x, 3x …) and view_offset snaps to integer pixels.
-        // This guarantees every virtual pixel maps to a perfect integer
-        // block of render-target pixels — zero distortion at any zoom.
+        // pixel-perfect value: integers for zoom-in (1×, 2×, 3× …) and
+        // 1/n fractions for zoom-out (½, ⅓, ¼ …).  view_offset snaps to
+        // integer pixels.  This guarantees every virtual pixel maps to a
+        // perfect integer block of render-target pixels (or vice-versa when
+        // zoomed out) — zero distortion at any zoom level.
         if self.pixel_perfect {
-            self.view_scale = self.view_scale.round().max(1.0);
+            self.view_scale = snap_pixel_perfect_scale(self.view_scale);
             self.view_offset.0 = self.view_offset.0.round();
             self.view_offset.1 = self.view_offset.1.round();
         }
@@ -855,7 +961,10 @@ impl VP {
                         // Get spritesheet info for UV calculation
                         let info = self.spritesheet_info.get(&layer_tilesheet_id).cloned()
                             .unwrap_or_else(|| SpritesheetInfo::new(l.ts, l.ts, l.ts, l.ts));
-                        let tile_idx = tid as u32 - 1;
+                        // Clamp tile index to valid range so out-of-range tile IDs
+                        // (e.g. painting tile #5 on a 2-tile sheet) don't produce
+                        // garbage UVs or cause a panic.
+                        let tile_idx = (tid as u32).saturating_sub(1).min(info.tile_count().saturating_sub(1).max(0));
                         let (u0, v0, u1, v1) = info.uv_for_tile(tile_idx);
                         b.verts.extend(&[
                             SV { pos: [x,y], uv: [u0,v0], color: [1.0,1.0,1.0,1.0], layer: l.z_index as f32 },
